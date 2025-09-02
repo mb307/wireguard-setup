@@ -1,132 +1,142 @@
 #!/bin/bash
-# WireGuard Setup Script with automatic server key generation and multi-client support
+# Full WireGuard setup and client management script
+# Usage:
+#   sudo ./wireguard-full-setup.sh init          -> setup server
+#   sudo ./wireguard-full-setup.sh add client1  -> add a client
 
 set -e
 
-WG_CONF="/etc/wireguard/wg0.conf"
 WG_DIR="/etc/wireguard"
-WG_PORT=51820
-WG_SUBNET="10.8.0.0/24"
-CLIENT_DIR="$WG_DIR/clients"
+WG_CONF="$WG_DIR/wg0.conf"
 
-# Ensure directories exist
-sudo mkdir -p $WG_DIR $CLIENT_DIR
-sudo chmod 700 $WG_DIR $CLIENT_DIR
-
-# Install dependencies if missing
-sudo apt update
-sudo apt install -y wireguard qrencode iptables-persistent ufw
-
-# Generate server keys if missing
-if [ ! -f $WG_DIR/server_private.key ]; then
-    echo "Generating WireGuard server keys..."
-    sudo wg genkey | sudo tee $WG_DIR/server_private.key | sudo wg pubkey > $WG_DIR/server_public.key
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run as root"
+    exit 1
 fi
 
-SERVER_PRIV=$(sudo cat $WG_DIR/server_private.key)
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
 
-# Create wg0.conf if missing
-if [ ! -f $WG_CONF ]; then
-    echo "Creating wg0.conf..."
-    sudo tee $WG_CONF > /dev/null <<EOF
+# Install missing dependencies
+for pkg in wireguard qrencode iptables iproute2; do
+    if ! command_exists $pkg; then
+        echo "[*] Installing $pkg..."
+        apt update && apt install -y $pkg
+    fi
+done
+
+# Detect outbound interface
+OUT_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
+echo "[*] Detected outbound interface: $OUT_IF"
+
+# Ensure IP forwarding
+sysctl -w net.ipv4.ip_forward=1
+grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf || echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+
+mkdir -p "$WG_DIR"
+chmod 700 "$WG_DIR"
+
+init_server() {
+    echo "[*] Initializing server..."
+
+    # Generate server keys if missing
+    SERVER_PRIV="$WG_DIR/server_private.key"
+    SERVER_PUB="$WG_DIR/server_public.key"
+    if [ ! -f "$SERVER_PRIV" ]; then
+        wg genkey | tee "$SERVER_PRIV" | wg pubkey > "$SERVER_PUB"
+        echo "[*] Server keys generated"
+    fi
+
+    SERVER_KEY=$(cat "$SERVER_PRIV")
+
+    # Backup existing config if exists
+    if [ -f "$WG_CONF" ]; then
+        cp "$WG_CONF" "${WG_CONF}.bak_$(date +%F_%T)"
+    fi
+
+    # Write wg0.conf
+    cat > "$WG_CONF" <<EOF
 [Interface]
 Address = 10.8.0.1/24
-ListenPort = $WG_PORT
-PrivateKey = $SERVER_PRIV
+ListenPort = 51820
+PrivateKey = $SERVER_KEY
 SaveConfig = true
 
-# NAT for all client traffic
-PostUp = iptables -t nat -A POSTROUTING -o $(ip route get 1.1.1.1 | awk '{print $5; exit}') -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -o $(ip route get 1.1.1.1 | awk '{print $5; exit}') -j MASQUERADE
+PostUp = iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $OUT_IF -j MASQUERADE
+PostDown = iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $OUT_IF -j MASQUERADE
 EOF
-fi
 
-# Enable IP forwarding
-sudo sysctl -w net.ipv4.ip_forward=1
-sudo sysctl -w net.ipv6.conf.all.forwarding=1
+    wg-quick down wg0 2>/dev/null || true
+    wg-quick up wg0
+    systemctl enable wg-quick@wg0
+    systemctl restart wg-quick@wg0
 
-# Bring up WireGuard interface
-sudo wg-quick up wg0 || true
+    echo "[+] Server initialized successfully!"
+    wg show
+}
 
-# Enable systemd service
-sudo systemctl enable wg-quick@wg0
-sudo systemctl start wg-quick@wg0 || true
-
-# Function to add a client
 add_client() {
-    CLIENT_NAME=$1
+    CLIENT_NAME="$1"
     if [ -z "$CLIENT_NAME" ]; then
-        echo "Usage: $0 add <clientname>"
+        echo "Usage: $0 add <client-name>"
         exit 1
     fi
 
+    echo "[*] Adding client $CLIENT_NAME..."
+
     CLIENT_PRIV=$(wg genkey)
     CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
-    SERVER_PUB=$(sudo cat $WG_DIR/server_public.key)
 
-    # Find next available client IP
-    LAST_IP=$(grep "Address" $WG_CONF | awk -F'[/.]' '{print $4}' | sort -n | tail -1)
-    if [ -z "$LAST_IP" ]; then
-        CLIENT_IP=2
-    else
-        CLIENT_IP=$((LAST_IP+1))
-    fi
+    # Determine next available IP
+    LAST_IP=$(grep -oP 'AllowedIPs = 10\.8\.0\.\K\d+' "$WG_CONF" | sort -n | tail -1)
+    NEXT_IP=$((LAST_IP + 1))
+    [ -z "$LAST_IP" ] && NEXT_IP=2
 
-    CLIENT_CONF="$CLIENT_DIR/$CLIENT_NAME.conf"
-    sudo tee $CLIENT_CONF > /dev/null <<EOF
+    CLIENT_IP="10.8.0.$NEXT_IP/32"
+
+    # Append client to server config
+    SERVER_PUB=$(cat "$WG_DIR/server_public.key")
+    echo -e "\n[Peer]\nPublicKey = $CLIENT_PUB\nAllowedIPs = $CLIENT_IP" >> "$WG_CONF"
+
+    wg set wg0 peer "$CLIENT_PUB" allowed-ips "$CLIENT_IP"
+
+    # Write client config
+    CLIENT_CONF="$WG_DIR/$CLIENT_NAME.conf"
+    cat > "$CLIENT_CONF" <<EOF
 [Interface]
 PrivateKey = $CLIENT_PRIV
-Address = 10.8.0.$CLIENT_IP/24
+Address = $CLIENT_IP
 DNS = 1.1.1.1
 
 [Peer]
 PublicKey = $SERVER_PUB
-Endpoint = $(curl -s ifconfig.me):$WG_PORT
+Endpoint = <SERVER_PUBLIC_IP>:51820
 AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
 EOF
 
-    # Add client to server
-    sudo wg set wg0 peer $CLIENT_PUB allowed-ips 10.8.0.$CLIENT_IP/32
-
-    echo "Client $CLIENT_NAME added. QR code:"
-    qrencode -t ansiutf8 < $CLIENT_CONF
-}
-
-# Function to list clients
-list_clients() {
-    ls $CLIENT_DIR
-}
-
-# Function to remove client
-remove_client() {
-    CLIENT_NAME=$1
-    CLIENT_CONF="$CLIENT_DIR/$CLIENT_NAME.conf"
-    if [ ! -f "$CLIENT_CONF" ]; then
-        echo "Client $CLIENT_NAME does not exist."
-        exit 1
+    # Generate QR code if qrencode exists
+    if command_exists qrencode; then
+        echo "[*] QR code for $CLIENT_NAME:"
+        qrencode -t ansiutf8 < "$CLIENT_CONF"
+    else
+        echo "[!] qrencode not installed, skipping QR code"
     fi
-    CLIENT_PUB=$(grep "PrivateKey" $CLIENT_CONF | wg pubkey)
-    sudo wg set wg0 peer $CLIENT_PUB remove
-    sudo rm -f "$CLIENT_CONF"
-    echo "Client $CLIENT_NAME removed."
+
+    echo "[+] Client $CLIENT_NAME added, config saved to $CLIENT_CONF"
 }
 
 # Main
 case "$1" in
     init)
-        echo "WireGuard server is already initialized."
+        init_server
         ;;
     add)
         add_client "$2"
         ;;
-    list)
-        list_clients
-        ;;
-    remove)
-        remove_client "$2"
-        ;;
     *)
-        echo "Usage: $0 {init|add <client>|list|remove <client>}"
+        echo "Usage: $0 {init|add <client-name>}"
         exit 1
         ;;
 esac
