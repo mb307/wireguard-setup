@@ -1,8 +1,8 @@
 #!/bin/bash
-# Full WireGuard setup and client management script
+# Full WireGuard setup and client management script with automatic public IP detection
 # Usage:
-#   sudo ./wireguard-full-setup.sh init          -> setup server
-#   sudo ./wireguard-full-setup.sh add client1  -> add a client
+#   sudo ./wireguard-full-setup-autoip.sh init          -> setup server
+#   sudo ./wireguard-full-setup-autoip.sh add client1  -> add a client
 
 set -e
 
@@ -19,7 +19,7 @@ command_exists() {
 }
 
 # Install missing dependencies
-for pkg in wireguard qrencode iptables iproute2; do
+for pkg in wireguard qrencode iptables iproute2 curl; do
     if ! command_exists $pkg; then
         echo "[*] Installing $pkg..."
         apt update && apt install -y $pkg
@@ -29,6 +29,10 @@ done
 # Detect outbound interface
 OUT_IF=$(ip route get 1.1.1.1 | awk '{print $5; exit}')
 echo "[*] Detected outbound interface: $OUT_IF"
+
+# Detect public IP
+PUBLIC_IP=$(curl -s https://ifconfig.me)
+echo "[*] Detected public IP: $PUBLIC_IP"
 
 # Ensure IP forwarding
 sysctl -w net.ipv4.ip_forward=1
@@ -101,7 +105,7 @@ add_client() {
 
     wg set wg0 peer "$CLIENT_PUB" allowed-ips "$CLIENT_IP"
 
-    # Write client config
+    # Write client config with detected public IP
     CLIENT_CONF="$WG_DIR/$CLIENT_NAME.conf"
     cat > "$CLIENT_CONF" <<EOF
 [Interface]
@@ -111,7 +115,7 @@ DNS = 1.1.1.1
 
 [Peer]
 PublicKey = $SERVER_PUB
-Endpoint = <SERVER_PUBLIC_IP>:51820
+Endpoint = $PUBLIC_IP:51820
 AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
