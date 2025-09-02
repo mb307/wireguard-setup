@@ -1,0 +1,136 @@
+
++162
+Lines changed: 162 additions & 0 deletions
+Original file line number	Diff line number	Diff line change
+@@ -0,0 +1,162 @@
+#!/bin/bash
+# WireGuard + QR setup script for Debian/Ubuntu (full-tunnel VPN, multi-client)
+# Run as root
+# Usage:
+#   ./wireguard-setup.sh init
+#   ./wireguard-setup.sh add <client-name>
+#   ./wireguard-setup.sh list
+#   ./wireguard-setup.sh remove <client-name>
+WG_IF="wg0"
+WG_PORT="51820"
+WG_DIR="/etc/wireguard"
+SERVER_IP="10.8.0.1"
+SUBNET="10.8.0.0/24"
+# Detect default network interface (for NAT)
+EXT_IF=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1); exit}')
+init_server() {
+    echo "[+] Setting up WireGuard server on $WG_IF (external: $EXT_IF)"
+    apt update
+    apt install -y wireguard qrencode iptables-persistent ufw
+    umask 077
+    mkdir -p $WG_DIR
+    cd $WG_DIR
+    # Generate server keys if not exist
+    [ -f server_private.key ] || wg genkey | tee server_private.key | wg pubkey > server_public.key
+    SERVER_PRIV=$(cat server_private.key)
+    # Create base config if not exists
+    if [ ! -f $WG_DIR/$WG_IF.conf ]; then
+        cat > $WG_DIR/$WG_IF.conf <<EOF
+[Interface]
+Address = $SERVER_IP/24
+ListenPort = $WG_PORT
+PrivateKey = $SERVER_PRIV
+EOF
+    fi
+    # Enable IP forwarding
+    echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-wireguard-forwarding.conf
+    echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-wireguard-forwarding.conf
+    sysctl -p /etc/sysctl.d/99-wireguard-forwarding.conf
+    # Configure NAT
+    iptables -t nat -A POSTROUTING -o $EXT_IF -j MASQUERADE
+    netfilter-persistent save
+    # Configure UFW
+    if command -v ufw >/dev/null 2>&1; then
+        echo "[+] Configuring UFW"
+        ufw allow $WG_PORT/udp
+        ufw route allow in on $WG_IF out on $EXT_IF
+        ufw route allow in on $EXT_IF out on $WG_IF
+        sed -i 's/^#net\/ipv4\/ip_forward=1/net\/ipv4\/ip_forward=1/' /etc/ufw/sysctl.conf
+        sed -i 's/^#net\/ipv6\/conf\/all\/forwarding=1/net\/ipv6\/conf\/all\/forwarding=1/' /etc/ufw/sysctl.conf
+        ufw reload
+    fi
+    # Enable WireGuard
+    systemctl enable wg-quick@$WG_IF
+    systemctl restart wg-quick@$WG_IF
+    echo "[+] Server initialized."
+}
+add_client() {
+    CLIENT=$1
+    if [ -z "$CLIENT" ]; then
+        echo "Usage: $0 add <client-name>"
+        exit 1
+    fi
+    cd $WG_DIR
+    SERVER_PUB=$(cat server_public.key)
+    # Generate client keys
+    wg genkey | tee ${CLIENT}_private.key | wg pubkey > ${CLIENT}_public.key
+    CLIENT_PRIV=$(cat ${CLIENT}_private.key)
+    CLIENT_PUB=$(cat ${CLIENT}_public.key)
+    # Find next available IP
+    LAST_IP=$(grep AllowedIPs $WG_IF.conf | tail -n1 | awk '{print $3}' | cut -d'/' -f1)
+    if [ -z "$LAST_IP" ]; then
+        CLIENT_IP="10.8.0.2"
+    else
+        IFS=. read -r i1 i2 i3 i4 <<< "$LAST_IP"
+        CLIENT_IP="$i1.$i2.$i3.$((i4+1))"
+    fi
+    # Add to server config
+    cat >> $WG_IF.conf <<EOF
+# $CLIENT
+[Peer]
+PublicKey = $CLIENT_PUB
+AllowedIPs = $CLIENT_IP/32
+EOF
+    wg syncconf $WG_IF <(wg-quick strip $WG_IF)
+    # Create client config
+    cat > ${CLIENT}.conf <<EOF
+[Interface]
+PrivateKey = $CLIENT_PRIV
+Address = $CLIENT_IP/24
+DNS = 1.1.1.1
+[Peer]
+PublicKey = $SERVER_PUB
+Endpoint = $(hostname -I | awk '{print $1}'):$WG_PORT
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+EOF
+    echo "[+] Client $CLIENT added with IP $CLIENT_IP"
+    echo "[+] Config saved to $WG_DIR/${CLIENT}.conf"
+    # Show QR code
+    qrencode -t ansiutf8 < ${CLIENT}.conf
+}
+list_clients() {
+    echo "[+] Registered clients:"
+    grep '^#' $WG_DIR/$WG_IF.conf | sed 's/^# //'
+}
+remove_client() {
+    CLIENT=$1
+    if [ -z "$CLIENT" ]; then
+        echo "Usage: $0 remove <client-name>"
+        exit 1
+    fi
+    cd $WG_DIR
+    CLIENT_PUB=$(cat ${CLIENT}_public.key 2>/dev/null)
+    if [ -z "$CLIENT_PUB" ]; then
+        echo "[-] Client $CLIENT not found."
+        exit 1
+    fi
+    # Remove from server config
+    sed -i "/# $CLIENT/,+2d" $WG_IF.conf
+    wg syncconf $WG_IF <(wg-quick strip $WG_IF)
+    # Delete client files
+    rm -f ${CLIENT}_private.key ${CLIENT}_public.key ${CLIENT}.conf
+    echo "[+] Client $CLIENT removed."
+}
+case "$1" in
+    init)   init_server ;;
+    add)    add_client "$2" ;;
+    list)   list_clients ;;
+    remove) remove_client "$2" ;;
+    *)      echo "Usage: $0 {init|add <name>|list|remove <name>}"; exit 1 ;;
+esac
